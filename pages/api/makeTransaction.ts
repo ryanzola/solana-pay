@@ -1,32 +1,45 @@
+import { createTransferCheckedInstruction, getAssociatedTokenAddress, getMint } from "@solana/spl-token"
 import { WalletAdapterNetwork } from "@solana/wallet-adapter-base"
-import { clusterApiUrl, Connection, PublicKey, Transaction, SystemProgram, LAMPORTS_PER_SOL } from "@solana/web3.js"
+import { clusterApiUrl, Connection, PublicKey, Transaction } from "@solana/web3.js"
 import { NextApiRequest, NextApiResponse } from "next"
-import { shopAddress } from "../../lib/addresses"
+import { shopAddress, usdcAddress } from "../../lib/addresses"
 import calculatePrice from "../../lib/calculatePrice"
 
 export type MakeTransactionInputData = {
   account: string,
 }
 
+type MakeTransactionGetResponse = {
+  label: string,
+  icon: string,
+}
+
 export type MakeTransactionOutputData = {
   transaction: string,
-  message: string
+  message: string,
 }
 
 type ErrorOutput = {
   error: string
 }
 
-export default async function handler(
+function get(res: NextApiResponse<MakeTransactionGetResponse>) {
+  res.status(200).json({
+    label: "Cookies Inc",
+    icon: "https://freesvg.org/img/1370962427.png",
+  })
+}
+
+async function post(
   req: NextApiRequest,
-  res: NextApiResponse<MakeTransactionOutputData | ErrorOutput> 
+  res: NextApiResponse<MakeTransactionOutputData | ErrorOutput>
 ) {
   try {
     // pass the selected items in the query
     // calculate the expected cost
     const amount = calculatePrice(req.query)
     if(amount.toNumber() === 0) {
-      res.status(400).json({ error: "Can't checkout with charge of 0" })
+      res.status(400).json({ error: "Can't checkout with charge of 0"})
       return
     }
 
@@ -37,7 +50,7 @@ export default async function handler(
       return
     }
 
-    // pass the buyer's public key in JSON body
+    // pass the buyers public key in JSON body
     const { account } = req.body as MakeTransactionInputData
     if(!account) {
       res.status(400).json({ error: "No account provided" })
@@ -51,7 +64,13 @@ export default async function handler(
     const endpoint = clusterApiUrl(network)
     const connection = new Connection(endpoint)
 
-    // get recent blockhash to include in the transaction
+    // get details about the USDC token
+    const usdcMint = await getMint(connection, usdcAddress)
+    // get the buyers USDC token account address
+    const buyersUsdcAddress = await getAssociatedTokenAddress(usdcAddress, buyerPublicKey)
+    // get the shops USDC token account address
+    const shopUsdcAddress = await getAssociatedTokenAddress(usdcAddress, shopPublicKey)
+
     const { blockhash } = await (connection.getLatestBlockhash('finalized'))
 
     const transaction = new Transaction({
@@ -60,15 +79,18 @@ export default async function handler(
       feePayer: buyerPublicKey
     })
 
-    // create the instruction to send SOL from the buyer to the shop
-    const transferInstruction = SystemProgram.transfer({
-      fromPubkey: buyerPublicKey,
-      lamports: amount.multipliedBy(LAMPORTS_PER_SOL).toNumber(),
-      toPubkey: shopPublicKey
-    })
+    // create the insttruction to send USDC from the buyer to the shop
+    const transferInstruction = createTransferCheckedInstruction(
+      buyersUsdcAddress,                              // source
+      usdcAddress,                                    // mint (token address)
+      shopUsdcAddress,                                // destination
+      buyerPublicKey,                                 // owner of source address
+      amount.toNumber() * (10 ** usdcMint.decimals),  // amount to transfer ( in units of USDC token)
+      usdcMint.decimals,                              //decimals of the USDC token
+    )
 
-    // add the reference to the instructions as a key
-    // this will mean that this transaction is returned when we query for the reference
+    // add the reference to the instruction as a key
+    // this transaction is returned when querying for the reference
     transferInstruction.keys.push({
       pubkey: new PublicKey(reference),
       isSigner: false,
@@ -80,12 +102,12 @@ export default async function handler(
 
     // serialize the transaction and convert to base64 to return it
     const serializedTransaction = transaction.serialize({
-      // will need the buyer to sign this transaction after it is returned
+      // will need the buyer to sign this transaction after its returned to them
       requireAllSignatures: false
     })
     const base64 = serializedTransaction.toString('base64')
 
-    // insert into database: reference, amount
+    // @TODO insert into database: reference, amount
 
     // return the serialized transaction
     res.status(200).json({
@@ -94,8 +116,20 @@ export default async function handler(
     })
   } catch(err) {
     console.error(err)
-
-    res.status(500).json({ error: 'error creating transaction', })
+    res.status(500).json({ error: "error creating transaction", })
     return
+  }
+}
+
+export default async function handler(
+  req: NextApiRequest,
+  res: NextApiResponse<MakeTransactionGetResponse | MakeTransactionOutputData | ErrorOutput>
+) {
+  if(req.method === "GET") {
+    return get(res)
+  } else if(req.method === "POST") {
+    return await post(req, res)
+  } else {
+    return res.status(405).json({ error: "Method not allowed"})
   }
 }

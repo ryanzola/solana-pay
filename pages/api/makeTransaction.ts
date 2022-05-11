@@ -1,9 +1,10 @@
-import { createTransferCheckedInstruction, getAssociatedTokenAddress, getMint } from "@solana/spl-token"
+import { createTransferCheckedInstruction, getAssociatedTokenAddress, getMint, getOrCreateAssociatedTokenAccount } from "@solana/spl-token"
 import { WalletAdapterNetwork } from "@solana/wallet-adapter-base"
-import { clusterApiUrl, Connection, PublicKey, Transaction } from "@solana/web3.js"
+import { clusterApiUrl, Connection, Keypair, PublicKey, Transaction } from "@solana/web3.js"
 import { NextApiRequest, NextApiResponse } from "next"
-import { shopAddress, usdcAddress } from "../../lib/addresses"
+import { couponAddress, shopAddress, usdcAddress } from "../../lib/addresses"
 import calculatePrice from "../../lib/calculatePrice"
+import base58 from 'bs58';
 
 export type MakeTransactionInputData = {
   account: string,
@@ -57,12 +58,35 @@ async function post(
       return
     }
 
+    // get the shop private key from .eng
+    // this is the same as in the scrop
+    const shopPrivateKey = process.env.SHOP_PRIVATE_KEY as string
+    if(!shopPrivateKey) {
+      res.status(500).json({ error: "Shop private key not available"})
+      return
+    }
+    const shopKeypair = Keypair.fromSecretKey(base58.decode(shopPrivateKey))
+
     const buyerPublicKey = new PublicKey(account)
     const shopPublicKey = shopAddress
 
     const network = WalletAdapterNetwork.Devnet
     const endpoint = clusterApiUrl(network)
     const connection = new Connection(endpoint)
+
+    // get the buyer and seller coupon token accounts
+    // if buyer account does not exist, create it (this costs SOL) as the shop account
+    const buyerCouponAccount = await getOrCreateAssociatedTokenAccount(
+      connection,
+      shopKeypair,   // shop pays the fee to create it
+      couponAddress,  // which token the account is for
+      buyerPublicKey, // who the token account belongs to (the buyer)
+    )
+
+    const shopCouponAddress = await getAssociatedTokenAddress(couponAddress, shopPublicKey)
+
+    // if the buyer has at least 5 coupons, they can use them to get a discount
+    const buyerGetsCouponDiscount = buyerCouponAccount.amount >= 5
 
     // get details about the USDC token
     const usdcMint = await getMint(connection, usdcAddress)
@@ -79,13 +103,15 @@ async function post(
       feePayer: buyerPublicKey
     })
 
+    const amountToPay = buyerGetsCouponDiscount ? amount.dividedBy(2) : amount
+
     // create the insttruction to send USDC from the buyer to the shop
     const transferInstruction = createTransferCheckedInstruction(
       buyersUsdcAddress,                              // source
       usdcAddress,                                    // mint (token address)
       shopUsdcAddress,                                // destination
       buyerPublicKey,                                 // owner of source address
-      amount.toNumber() * (10 ** usdcMint.decimals),  // amount to transfer ( in units of USDC token)
+      amountToPay.toNumber() * (10 ** usdcMint.decimals),  // amount to transfer ( in units of USDC token)
       usdcMint.decimals,                              //decimals of the USDC token
     )
 
@@ -97,8 +123,55 @@ async function post(
       isWritable: false,
     })
 
-    // add the instruction to the transaction
-    transaction.add(transferInstruction)
+    // create the instruction to send the coupon from the shop to the buyer
+    // const couponInstruction = createTransferCheckedInstruction(
+    //   shopCouponAddress,    // source account (coupon)
+    //   couponAddress,        // token address (coupon)
+    //   buyerCouponAccount,   // destination account (coupon)
+    //   shopPublicKey,        // owner of source account
+    //   1,                    // amount to transfer
+    //   0,                    // decimals of the token
+    // )
+
+    
+    const couponInstruction = buyerGetsCouponDiscount ? 
+      // the coupon instruction is to send 5 coupons from the buyer to the shop
+      createTransferCheckedInstruction(
+        buyerCouponAccount.address,   // source account (coupons)
+        couponAddress,                // token address (coupons)
+        shopCouponAddress,            // destination account (coupons)
+        buyerPublicKey,               // owner of the source account
+        5,                            // amount to transfer
+        0                             // decimals of the token
+      ) :
+      // the coupon instruction is to send 1 coupon from the shop to the buyer
+      createTransferCheckedInstruction(
+        shopCouponAddress,            // source account (coupon)
+        couponAddress,                // token address (coupon)
+        buyerCouponAccount.address,   // destination account
+        shopPublicKey,                // owner of source account
+        1,                            // amount to transfer
+        0                             // decimals of the token
+      )
+    
+    // add the shop as a signer to the coupon instruction
+    // if the shop is sending a coupon, it already will be a signer
+    // but if the buyer is sending the coupons, the shop wont be a
+    // signer automatically. it's useful security to have the shop
+    // sign the transaction
+    couponInstruction.keys.push({
+      pubkey: shopPublicKey,
+      isSigner: true,
+      isWritable: false
+    })
+
+    // add both instructions to the transaction
+    transaction.add(transferInstruction, couponInstruction)
+
+    // sign the transaction as the shop.
+    // this is required to transfer the coupon
+    // the shop must partial sign because the transfer instruction still requires the user
+    transaction.partialSign(shopKeypair)
 
     // serialize the transaction and convert to base64 to return it
     const serializedTransaction = transaction.serialize({
@@ -109,10 +182,12 @@ async function post(
 
     // @TODO insert into database: reference, amount
 
+    const message = buyerGetsCouponDiscount ? "50% Discount! 🍪" : "Thanks for your order! 🍪"
+
     // return the serialized transaction
     res.status(200).json({
       transaction: base64,
-      message: "Thanks for your order! 🍪"
+      message: message
     })
   } catch(err) {
     console.error(err)
